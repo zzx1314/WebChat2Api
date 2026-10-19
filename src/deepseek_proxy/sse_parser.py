@@ -575,38 +575,229 @@ def _parse_dsml_tool_calls(buf: str) -> list[dict]:
     return calls
 
 
+_RE_CODE_FENCE = re.compile(r"^```[a-zA-Z0-9_-]*\s*\n?|\n?```$")
+_RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+
+_NAME_KEYS = ("name", "tool", "tool_name", "function")
+_ARG_KEYS = ("arguments", "parameters", "args", "input")
+
+
 def _parse_tool_calls_json(buf: str) -> list[dict]:
-    """从 tool_calls 内容中解析 JSON"""
-    buf = buf.strip()
-    try:
-        parsed = json.loads(buf)
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict):
-            return [parsed]
-    except json.JSONDecodeError:
+    """从 tool_calls 内容中解析 JSON
+
+    模型经常在参数里直接写未转义的引号或非法转义（例如 shell 命令里的
+    `echo "x"`、grep 的 `\\|`），严格 json.loads 会失败。此处先严格解析，
+    失败后自动修复字符串内部的引号/换行/非法转义再重试，避免把工具调用
+    当成普通正文回吐给客户端（客户端会直接结束回合）。
+    """
+    buf = _strip_code_fence(buf.strip())
+    if not buf:
+        return []
+
+    for candidate in _json_candidates(buf):
         try:
-            fixed = buf.replace("'", '"')
-            parsed = json.loads(fixed)
-            if isinstance(parsed, list):
-                return parsed
-            if isinstance(parsed, dict):
-                return [parsed]
-        except json.JSONDecodeError:
-            pass
-    return []
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        calls = _normalize_tool_calls(parsed)
+        if calls:
+            return calls
+
+    # 最后兜底: JSON 结构严重损坏时，靠字段名 + 大括号配对提取
+    return _parse_tool_calls_loose(buf)
+
+
+def _parse_tool_calls_loose(buf: str) -> list[dict]:
+    """结构扫描兜底: 提取 name 及其后的参数对象原文
+
+    仅在 JSON 与自动修复都失败时使用，保证模型已明确表达的调用不会因为
+    一处引号错误就退化成正文（客户端会因此直接结束回合）。
+    """
+    calls: list[dict] = []
+    name_re = re.compile(r'["\']?(?:name|tool|tool_name)["\']?\s*:\s*["\']([^"\']+)["\']')
+    args_re = re.compile(r'["\']?(?:arguments|parameters|args|input)["\']?\s*:\s*')
+
+    for m in name_re.finditer(buf):
+        name = m.group(1).strip()
+        if not name:
+            continue
+        km = args_re.search(buf, m.end())
+        if not km:
+            calls.append({"name": name, "arguments": {}})
+            continue
+
+        tail = buf[km.end():]
+        brace = tail.find("{")
+        if brace < 0:
+            calls.append({"name": name, "arguments": {}})
+            continue
+
+        depth = 0
+        end = -1
+        for idx in range(brace, len(tail)):
+            ch = tail[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = idx
+                    break
+        raw_args = tail[brace:end + 1] if end > 0 else tail[brace:]
+        calls.append({"name": name, "arguments": _normalize_arguments(raw_args)})
+
+    return calls
+
+
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    return _RE_CODE_FENCE.sub("", stripped).strip()
+
+
+def _json_candidates(buf: str):
+    yield buf
+
+    repaired = _escape_invalid_strings(buf)
+    repaired = _RE_TRAILING_COMMA.sub(r"\1", repaired)
+    if repaired != buf:
+        yield repaired
+
+    # 单引号形式的对象 (无任何双引号时才尝试，避免误伤正常内容)
+    if "'" in buf and '"' not in buf:
+        yield buf.replace("'", '"')
+
+
+def _escape_invalid_strings(text: str) -> str:
+    """修复 JSON 字符串内部的未转义引号、裸换行和非法转义
+
+    规则:
+    - 字符串内的 `"` 只有在后面紧跟 `,` `}` `]` `:` 或结尾时才算闭合，
+      其余视为内容中的引号并转义 (`echo "x"` → `echo \\"x\\"`)
+    - `\\|` 这类非法转义改为 `\\\\|`，保留原始反斜杠
+    - 裸换行/制表符转成 `\\n` / `\\t`
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt in '"\\/bfnrtu':
+                out.append(ch)
+                if nxt:
+                    out.append(nxt)
+                    i += 2
+                else:
+                    i += 1
+            else:
+                # 非法转义: 把反斜杠本身转义，保留字符
+                out.append("\\\\")
+                i += 1
+            continue
+
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in ',}]:':
+                out.append('"')
+                in_string = False
+            else:
+                out.append('\\"')
+        else:
+            out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _normalize_tool_calls(parsed: Any) -> list[dict]:
+    """兼容多种字段命名，统一成 [{name, arguments(dict)}]"""
+    if isinstance(parsed, dict):
+        items = [parsed]
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        return []
+
+    calls: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            item = {**item, **fn}
+
+        name = ""
+        for key in _NAME_KEYS:
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                name = value.strip()
+                break
+        if not name:
+            continue
+
+        args: Any = None
+        for key in _ARG_KEYS:
+            if key in item:
+                args = item[key]
+                break
+
+        calls.append({"name": name, "arguments": _normalize_arguments(args)})
+
+    return calls
+
+
+def _normalize_arguments(args: Any) -> dict:
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        text = _strip_code_fence(args.strip())
+        if text:
+            for candidate in _json_candidates(text):
+                try:
+                    parsed = json.loads(candidate)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    return parsed[0]
+    return {}
 
 
 def _build_tool_call_deltas(parsed: list[dict]) -> list[dict]:
     tc_deltas = []
     for i, tc in enumerate(parsed):
+        name = tc.get("name", "")
+        if not name:
+            continue
         tc_deltas.append({
             "index": i,
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
             "function": {
-                "name": tc.get("name", ""),
-                "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
+                "name": name,
+                "arguments": json.dumps(tc.get("arguments") or {}, ensure_ascii=False),
             },
         })
     return tc_deltas

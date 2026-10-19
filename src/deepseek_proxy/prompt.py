@@ -201,6 +201,11 @@ def _format_tools(tools: list[dict], tool_choice: Any = None) -> Optional[str]:
     lines.append("")
     lines.append("IMPORTANT: Output the tool call inside <tool_calls> tags exactly as shown above.")
     lines.append("The arguments must be a valid JSON object, not a string.")
+    lines.append(
+        'Inside string values, every double quote MUST be escaped as \\" and every '
+        'backslash as \\\\. Prefer single quotes in shell commands to avoid escaping. '
+        'Never put raw line breaks inside a JSON string.'
+    )
 
     # 处理 tool_choice
     if isinstance(tool_choice, dict):

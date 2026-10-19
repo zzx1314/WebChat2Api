@@ -284,6 +284,82 @@ async def test_incomplete_status_not_content():
     print("  \u2713 quasi_status/status 控制字段未混入正文")
 
 
+# 模拟真实失败样本 (Pi 日志): 模型把工具调用写成正文，且参数里的双引号、`\|` 未转义
+UNESCAPED_TOOL_CALLS_TEXT = (
+    'Now let me verify remaining discrepancies:\n\n'
+    '<tool_calls>[{"name": "bash", "arguments": {"command": '
+    '"cd /repo && echo "=== A ===" && grep -n "root_password\\|insert" f; '
+    'echo "=== B ===" && sed -n \'1,5p\' g"}}, '
+    '{"name": "bash", "arguments": {"command": "echo hi"}}]</tool_calls>'
+)
+
+
+def _mock_from_text(text: str, pieces: int = 4):
+    """把正文拆成多个 content delta，模拟跨 chunk 输出"""
+    size = max(1, len(text) // pieces + 1)
+    parts = [text[i:i + size] for i in range(0, len(text), size)]
+    events = b"event: ready\ndata: {}\n\n" + _sse_event({"v": {"response": {
+        "thinking_enabled": True,
+        "fragments": [{"type": "RESPONSE", "content": pieces and parts[0]}],
+    }}})
+    for part in parts[1:]:
+        events += _sse_event({"p": "response/fragments/-1/content", "o": "APPEND", "v": part})
+    events += _sse_event({"p": "response/status", "o": "SET", "v": "FINISHED"})
+    events += b"event: finish\ndata: {}\n\n"
+    return events
+
+
+async def test_unescaped_tool_calls_json():
+    print("\n=== 参数 JSON 转义损坏的工具调用 (真实 Pi 日志样本) ===")
+    async def byte_stream():
+        yield _mock_from_text(UNESCAPED_TOOL_CALLS_TEXT)
+
+    content = ""
+    calls = []
+    finish = None
+    async for chunk in full_sse_pipeline(byte_stream(), model="deepseek-v4-pro"):
+        ch = chunk.get("choices", [{}])[0]
+        delta = ch.get("delta", {})
+        content += delta.get("content") or ""
+        calls.extend(delta.get("tool_calls") or [])
+        finish = ch.get("finish_reason") or finish
+
+    assert "<tool_calls>" not in content, f"工具调用泄漏到 content: {content!r}"
+    assert content == "Now let me verify remaining discrepancies:\n\n", f"正文错误: {content!r}"
+    assert len(calls) == 2, f"Expected 2 tool calls, got {len(calls)}: {calls}"
+    assert finish == "tool_calls", f"finish_reason 应为 tool_calls，实际: {finish}"
+
+    first = json.loads(calls[0]["function"]["arguments"])
+    expected = (
+        'cd /repo && echo "=== A ===" && grep -n "root_password\\|insert" f; '
+        'echo "=== B ===" && sed -n \'1,5p\' g'
+    )
+    assert calls[0]["function"]["name"] == "bash"
+    assert first["command"] == expected, f"命令被改坏:\n{first['command']!r}\n!= {expected!r}"
+    assert json.loads(calls[1]["function"]["arguments"]) == {"command": "echo hi"}
+    print(f"  tool call 1: {first['command']}")
+    print(f"  finish_reason: {finish}")
+    print("  \u2713 未转义引号/非法转义修复后正确转为 tool_calls")
+
+
+async def test_tool_call_argument_variants():
+    print("\n=== 工具调用字段变体 ===")
+    from deepseek_proxy.sse_parser import _parse_tool_calls_json
+
+    # arguments 以 JSON 字符串给出
+    parsed = _parse_tool_calls_json('[{"name":"bash","arguments":"{\\"command\\":\\"ls\\"}"}]')
+    assert parsed == [{"name": "bash", "arguments": {"command": "ls"}}], parsed
+
+    # markdown 代码块 + parameters 别名
+    parsed = _parse_tool_calls_json('```json\n[{"name":"read","parameters":{"path":"a"}}]\n```')
+    assert parsed == [{"name": "read", "arguments": {"path": "a"}}], parsed
+
+    # 结构损坏 (括号未闭合) 时仍应识别出调用，而不是退化成正文
+    parsed = _parse_tool_calls_json('[{"name": "bash", "arguments": {"command": "echo "a b"')
+    assert len(parsed) == 1 and parsed[0]["name"] == "bash", parsed
+    print("  \u2713 字符串参数 / 代码块 / 括号损坏均能解析")
+
+
 async def main():
     await test_sse_events()
     print("---")
@@ -296,6 +372,8 @@ async def main():
     await test_think_answer_split()
     await test_think_runtime_append()
     await test_dsml_tool_calls()
+    await test_unescaped_tool_calls_json()
+    await test_tool_call_argument_variants()
     await test_incomplete_status_not_content()
     print("\n\u2705 All tests passed!")
 
