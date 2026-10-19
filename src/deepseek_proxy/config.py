@@ -7,6 +7,7 @@ DeepSeek Proxy — 配置文件
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -24,6 +25,43 @@ class SessionMode(str, Enum):
 class DeepSeekModel(str, Enum):
     DEFAULT = "default"                # deepseek-v4-flash（非思考模式）
     DEFAULT_SEARCH = "default_search"  # deepseek-v4-flash + 搜索
+
+
+_PROXY_ENV_KEYS = (
+    "DS_PROXY",
+    "ALL_PROXY", "all_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "HTTP_PROXY", "http_proxy",
+)
+
+
+def _normalize_proxy(url: str) -> str:
+    """httpx 只认识 socks5:// / socks5h://，把常见的 socks:// 别名转换成 socks5://"""
+    if url.lower().startswith("socks://"):
+        return "socks5://" + url[len("socks://"):]
+    return url
+
+
+def _env_proxy() -> str:
+    """读取代理环境变量 (DS_PROXY 优先)，默认使用系统代理设置"""
+    for key in _PROXY_ENV_KEYS:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return _normalize_proxy(val)
+    return ""
+
+
+def _extract_token(raw: str) -> str:
+    """兼容 DS_TOKEN 为 {"value": "..."} JSON 包装的写法"""
+    raw = raw.strip()
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        if isinstance(obj, dict) and isinstance(obj.get("value"), str):
+            return obj["value"].strip()
+    return raw
 
 
 @dataclass
@@ -55,6 +93,10 @@ class ProxyConfig:
     # --- AuthMode.TOKEN 专用 ---
     user_token: str = ""
 
+    # === 代理 ===
+    # 空 = 直连；默认从 DS_PROXY / ALL_PROXY / HTTPS_PROXY / HTTP_PROXY 环境变量读取
+    proxy: str = field(default_factory=_env_proxy)
+
     # === 会话策略 ===
     session_mode: SessionMode = SessionMode.REUSE
 
@@ -70,6 +112,9 @@ class ProxyConfig:
     # === 超时 (秒) ===
     http_timeout: float = 120.0
     token_refresh_interval: int = 3000  # 秒 (50 分钟, 保守)
+
+    def __post_init__(self):
+        self.user_token = _extract_token(self.user_token)
 
     @classmethod
     def from_dict(cls, d: dict) -> ProxyConfig:
@@ -98,7 +143,51 @@ def _env_list(key: str, default: str = "") -> list[str]:
     return [s.strip() for s in val.split(",") if s.strip()]
 
 
+def _load_dotenv(filename: str = ".env") -> str:
+    """加载 .env 文件，返回实际加载的路径 (没有则返回空字符串)。
+
+    已存在的环境变量优先，不会被覆盖。支持 KEY=VALUE、export 前缀、
+    引号包裹的值、# 注释与 [section] 头。
+    """
+    from pathlib import Path
+
+    candidates = [Path.cwd() / filename, Path(__file__).resolve().parents[2] / filename]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+        except OSError:
+            continue
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("["):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+
+            key, sep, value = line.partition("=")
+            key = key.strip()
+            if not sep or not key:
+                continue
+
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            else:
+                value = value.split(" #", 1)[0].strip()
+
+            os.environ.setdefault(key, value)
+
+        return str(path)
+
+    return ""
+
+
 # === 默认全局配置 (可通过环境变量覆盖) ===
+# 先加载 .env，保证下方 CONFIG 能读到文件中的配置
+DOTENV_PATH = _load_dotenv()
 CONFIG = ProxyConfig(
     # 认证: 改为 TOKEN 模式则填 user_token
     auth_mode=AuthMode(_env("DS_AUTH_MODE", "token")),
@@ -112,6 +201,9 @@ CONFIG = ProxyConfig(
     # Bearer Token (auth_mode=token 时使用)
     # ⚠️ 不要在代码中硬编码 token，请通过 DS_TOKEN 环境变量传入
     user_token=_env("DS_TOKEN"),
+
+    # 代理 (DS_PROXY 优先，其次系统代理环境变量)
+    proxy=_env_proxy(),
 
     # 会话策略
     session_mode=SessionMode(_env("DS_SESSION_MODE", "reuse")),

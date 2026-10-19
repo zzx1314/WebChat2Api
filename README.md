@@ -76,6 +76,7 @@ cp .env.example .env
 | `DS_AREA_CODE` | — | 区号（PASSWORD 模式） |
 | `DS_PASSWORD` | — | 密码（PASSWORD 模式） |
 | `DS_SESSION_MODE` | `reuse` | 会话策略：`reuse` 或 `new` |
+| `DS_PROXY` | — | HTTP/SOCKS 代理（留空则读取 `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`） |
 | `DS_HOST` | `127.0.0.1` | 监听地址 |
 | `DS_PORT` | `5317` | 监听端口 |
 | `DS_API_TOKENS` | — | API Key 鉴权（逗号分隔，留空=不鉴权） |

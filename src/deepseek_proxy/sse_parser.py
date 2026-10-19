@@ -24,7 +24,13 @@ from typing import Optional, AsyncIterator, Any
 MAX_BUF_SIZE = 4 * 1024 * 1024  # 4 MB，防止 OOM
 
 _RE_SEARCH_PREFIX = re.compile(r'^(SEARCH|WEB_SEARCH|SEARCHING)\s*', re.IGNORECASE)
+_TOOL_CALLS_OPEN = "<tool_calls>"
 _TOOL_CALLS_CLOSE = "</tool_calls>"
+
+# DeepSeek 网页模型原生工具调用格式 (DSML)
+_DSML_BAR = "｜｜DSML｜｜"
+_DSML_OPEN = f"<{_DSML_BAR} calls>"
+_DSML_CLOSE = f"</{_DSML_BAR} calls>"
 
 
 @dataclass
@@ -212,10 +218,26 @@ class DsState:
                 frames.append(DsFrame(type=DsFrameType.USAGE, value=int(v)))
             return frames
 
-        if path.endswith("/status"):
+        # response/status 与 BATCH 里的 quasi_status 都是控制字段，不能当成正文输出
+        if path.endswith("/status") or path.endswith("quasi_status"):
             status_val = v if isinstance(v, str) else str(v)
             self.status = status_val
             frames.append(DsFrame(type=DsFrameType.STATUS, value=status_val))
+            return frames
+
+        # 新 fragment 加入: 先追加到 fragments，后续 /fragments/-1/content 才能正确分流
+        if path == "response/fragments" and isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    ty = item.get("type", "")
+                    content = item.get("content", "")
+                    if not isinstance(content, str):
+                        content = ""
+                    self.fragments.append({"type": ty, "content": content})
+                    if content:
+                        f = _fragment_to_frame(ty, content)
+                        if f:
+                            frames.append(f)
             return frames
 
         if "/content" in path:
@@ -240,21 +262,6 @@ class DsState:
                     elif ty in (FRAG_RESPONSE, FRAG_ANSWER):
                         frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=text))
                         return frames
-
-            # fragments APPEND (新 fragment 加入)
-            if path == "response/fragments" and isinstance(v, list):
-                for item in v:
-                    if isinstance(item, dict):
-                        ty = item.get("type", "")
-                        content = item.get("content", "")
-                        if not isinstance(content, str):
-                            content = ""
-                        self.fragments.append({"type": ty, "content": content})
-                        if content:
-                            f = _fragment_to_frame(ty, content)
-                            if f:
-                                frames.append(f)
-                return frames
 
             frames.append(DsFrame(type=DsFrameType.CONTENT_DELTA, value=text))
             return frames
@@ -364,9 +371,101 @@ async def convert_to_openai_chunks(
     usage_sent = False
     usage_value: Optional[int] = None
 
-    # Tool Call 缓冲
-    tool_calls_active = False
-    tool_buffer = ""
+    # Tool Call 缓冲: 标签和 JSON 都可能被拆到多个 content delta 中
+    content_buffer = ""
+    tool_mode: Optional[str] = None  # None / "json" / "dsml"
+    tool_calls_emitted = False
+
+    def _parse_by_mode(raw: str, mode: str) -> list[dict]:
+        return _parse_tool_calls_json(raw) if mode == "json" else _parse_dsml_tool_calls(raw)
+
+    def process_content(text: str) -> list[dict]:
+        """处理 content delta，累积并识别可能跨 chunk 的工具调用标签"""
+        nonlocal content_buffer, tool_mode, tool_calls_emitted
+        chunks: list[dict] = []
+        content_buffer += text
+
+        while True:
+            if tool_mode is None:
+                candidates = [
+                    (content_buffer.find(tag), tag)
+                    for tag in (_TOOL_CALLS_OPEN, _DSML_OPEN)
+                ]
+                candidates = [(idx, tag) for idx, tag in candidates if idx >= 0]
+
+                if not candidates:
+                    # 保留末尾可能是半截标签的内容，其余立即下发
+                    keep = max(
+                        _partial_tag_suffix_len(content_buffer, tag)
+                        for tag in (_TOOL_CALLS_OPEN, _DSML_OPEN)
+                    )
+                    emit = content_buffer[:len(content_buffer) - keep]
+                    if emit:
+                        chunks.append(make_chunk(Delta(content=emit), model=model))
+                    content_buffer = content_buffer[len(content_buffer) - keep:]
+                    break
+
+                open_idx, open_tag = min(candidates, key=lambda item: item[0])
+                before = content_buffer[:open_idx]
+                if before:
+                    chunks.append(make_chunk(Delta(content=before), model=model))
+                content_buffer = content_buffer[open_idx + len(open_tag):]
+                tool_mode = "json" if open_tag == _TOOL_CALLS_OPEN else "dsml"
+            else:
+                close_tag = _TOOL_CALLS_CLOSE if tool_mode == "json" else _DSML_CLOSE
+                close_idx = content_buffer.find(close_tag)
+                if close_idx < 0:
+                    break
+
+                raw = content_buffer[:close_idx].strip()
+                content_buffer = content_buffer[close_idx + len(close_tag):]
+                mode = tool_mode
+                tool_mode = None
+
+                parsed = _parse_by_mode(raw, mode)
+                if parsed:
+                    chunks.append(make_chunk(
+                        Delta(tool_calls=_build_tool_call_deltas(parsed)),
+                        model=model,
+                    ))
+                    tool_calls_emitted = True
+                else:
+                    # 解析失败时原样输出，避免静默丢弃内容
+                    open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
+                    chunks.append(make_chunk(
+                        Delta(content=open_tag + raw + close_tag),
+                        model=model,
+                    ))
+
+        return chunks
+
+    def flush_content() -> list[dict]:
+        """流结束时吐出缓冲内容"""
+        nonlocal content_buffer, tool_mode, tool_calls_emitted
+        if not content_buffer:
+            return []
+
+        if tool_mode is not None:
+            raw = content_buffer.strip()
+            mode = tool_mode
+            content_buffer = ""
+            tool_mode = None
+            parsed = _parse_by_mode(raw, mode)
+            if parsed:
+                tool_calls_emitted = True
+                return [make_chunk(
+                    Delta(tool_calls=_build_tool_call_deltas(parsed)),
+                    model=model,
+                )]
+            open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
+            return [make_chunk(Delta(content=open_tag + raw), model=model)]
+
+        text = content_buffer
+        content_buffer = ""
+        return [make_chunk(Delta(content=text), model=model)]
+
+    def current_finish_reason() -> str:
+        return "tool_calls" if tool_calls_emitted else "stop"
 
     try:
         async for frame in ds_frame_stream:
@@ -382,55 +481,16 @@ async def convert_to_openai_chunks(
                 text = _clean_text(frame.value)
                 if not text:
                     continue
-
-                # ── Tool Call: 累积缓冲，检测 </tool_calls> 闭合标签 ──
-                if tool_calls_active:
-                    tool_buffer += text
-                    close_idx = tool_buffer.find(_TOOL_CALLS_CLOSE)
-                    if close_idx >= 0:
-                        tool_calls_active = False
-                        tc_json = tool_buffer[:close_idx].strip()
-                        parsed = _parse_tool_calls_json(tc_json)
-                        if parsed:
-                            tc_deltas = _build_tool_call_deltas(parsed)
-                            yield make_chunk(Delta(tool_calls=tc_deltas), model=model)
-                        after = tool_buffer[close_idx + len(_TOOL_CALLS_CLOSE):]
-                        tool_buffer = ""
-                        if after.strip():
-                            yield make_chunk(Delta(content=after), model=model)
-                    continue
-
-                # 检测 <tool_calls> 开始标签
-                open_idx = text.find("<tool_calls>")
-                if open_idx >= 0:
-                    tool_calls_active = True
-                    before = text[:open_idx]
-                    after_tag = text[open_idx + len("<tool_calls>"):]
-                    if before.strip():
-                        yield make_chunk(Delta(content=before), model=model)
-                    tool_buffer = after_tag
-                    # 检查是否同一 chunk 内就闭合
-                    close_idx = tool_buffer.find(_TOOL_CALLS_CLOSE)
-                    if close_idx >= 0:
-                        tool_calls_active = False
-                        tc_json = tool_buffer[:close_idx].strip()
-                        parsed = _parse_tool_calls_json(tc_json)
-                        if parsed:
-                            tc_deltas = _build_tool_call_deltas(parsed)
-                            yield make_chunk(Delta(tool_calls=tc_deltas), model=model)
-                        after = tool_buffer[close_idx + len(_TOOL_CALLS_CLOSE):]
-                        tool_buffer = ""
-                        if after.strip():
-                            yield make_chunk(Delta(content=after), model=model)
-                    continue
-
-                yield make_chunk(Delta(content=text), model=model)
+                for chunk in process_content(text):
+                    yield chunk
 
             elif frame.type == DsFrameType.STATUS:
                 status = str(frame.value) if frame.value else ""
                 if status == "FINISHED" and not finished:
+                    for chunk in flush_content():
+                        yield chunk
                     finished = True
-                    yield make_chunk(Delta(), model=model, finish_reason="stop")
+                    yield make_chunk(Delta(), model=model, finish_reason=current_finish_reason())
 
             elif frame.type == DsFrameType.USAGE:
                 usage_value = int(frame.value) if frame.value else 0
@@ -440,12 +500,29 @@ async def convert_to_openai_chunks(
 
             elif frame.type == DsFrameType.FINISH:
                 if not finished:
+                    for chunk in flush_content():
+                        yield chunk
                     finished = True
-                    yield make_chunk(Delta(), model=model, finish_reason="stop")
+                    yield make_chunk(Delta(), model=model, finish_reason=current_finish_reason())
 
     finally:
         if finished and include_usage and not usage_sent and usage_value is not None:
             yield make_usage_chunk(prompt_tokens, usage_value)
+
+    # 流正常结束但没收到 FINISHED 状态: 补发缓冲内容与结束标记
+    for chunk in flush_content():
+        yield chunk
+    if not finished:
+        finished = True
+        yield make_chunk(Delta(), model=model, finish_reason=current_finish_reason())
+
+
+def _partial_tag_suffix_len(text: str, tag: str) -> int:
+    """返回 text 末尾与 tag 前缀匹配的最长长度（用于跨 chunk 的标签检测）"""
+    for size in range(min(len(text), len(tag) - 1), 0, -1):
+        if text.endswith(tag[:size]):
+            return size
+    return 0
 
 
 def _clean_text(text: Any) -> str:
@@ -454,6 +531,48 @@ def _clean_text(text: Any) -> str:
     text = text.replace("FINISHED", "")
     text = _RE_SEARCH_PREFIX.sub('', text)
     return text
+
+
+def _parse_dsml_tool_calls(buf: str) -> list[dict]:
+    """解析 DeepSeek 原生 DSML 工具调用格式
+
+    <｜｜DSML｜｜ calls>
+    <｜｜DSML｜｜ invoke name="bash">
+    <｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜DSML｜｜ parameter>
+    </｜｜DSML｜｜ invoke>
+    </｜｜DSML｜｜ calls>
+    """
+    normalized = buf.replace(_DSML_BAR, "DSML").replace("||DSML||", "DSML")
+    calls: list[dict] = []
+
+    for invoke in re.finditer(
+        r'<DSML\s+invoke\s+name="([^"]+)"\s*>(.*?)</DSML\s+invoke>',
+        normalized,
+        re.DOTALL,
+    ):
+        name = invoke.group(1)
+        arguments: dict[str, Any] = {}
+
+        for param in re.finditer(
+            r'<DSML\s+parameter\s+name="([^"]+)"'
+            r'(?:\s+string="(true|false)")?\s*>(.*?)</DSML\s+parameter>',
+            invoke.group(2),
+            re.DOTALL,
+        ):
+            pname = param.group(1)
+            as_string = param.group(2)
+            raw = param.group(3)
+            if as_string == "true":
+                arguments[pname] = raw
+            else:
+                try:
+                    arguments[pname] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    arguments[pname] = raw
+
+        calls.append({"name": name, "arguments": arguments})
+
+    return calls
 
 
 def _parse_tool_calls_json(buf: str) -> list[dict]:

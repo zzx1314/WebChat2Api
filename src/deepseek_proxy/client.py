@@ -148,6 +148,40 @@ class BusinessError(ClientError):
         super().__init__(f"Business error: code={code}, msg={msg}")
 
 
+def _unwrap_envelope(payload: Any) -> Any:
+    """拆开 DeepSeek 返回的信封，兼容 {code,msg,data} 与 {success,data} 两种格式"""
+    if not isinstance(payload, dict):
+        return payload
+
+    # 旧版/部分端点: {success: bool, data: ...}
+    if "success" in payload:
+        if not payload.get("success"):
+            raise BusinessError(
+                payload.get("code", -1),
+                payload.get("msg", "unknown error"),
+            )
+        return _unwrap_biz_data(payload.get("data", {}))
+
+    # 当前 API: {code: 0, msg: "", data: ...}
+    if "code" in payload and "data" in payload:
+        code = payload.get("code")
+        if code not in (0, None):
+            raise BusinessError(code, payload.get("msg", "unknown error"))
+        return _unwrap_biz_data(payload.get("data"))
+
+    return payload
+
+
+def _unwrap_biz_data(data: Any) -> Any:
+    """部分端点在 data 里再包一层 {biz_code, biz_msg, biz_data}"""
+    if isinstance(data, dict) and "biz_code" in data:
+        if data["biz_code"] != 0:
+            raise BusinessError(data["biz_code"], data.get("biz_msg", "unknown error"))
+        if "biz_data" in data:
+            return data["biz_data"]
+    return data
+
+
 # ═══════════════════════════════════════════════════════════
 # DeepSeek Client
 # ═══════════════════════════════════════════════════════════
@@ -165,6 +199,8 @@ class DsClient:
             timeout=httpx.Timeout(config.http_timeout),
             limits=limits,
             follow_redirects=True,
+            # 显式传入代理，避免 httpx 直接解析 ALL_PROXY 中的 socks:// 别名而报错
+            proxy=config.proxy or None,
         )
 
     def _base_headers(self, token: str,
@@ -185,29 +221,13 @@ class DsClient:
             headers["X-Ds-Pow-Response"] = pow_response
         return headers
 
-    async def _parse_envelope(self, resp: httpx.Response) -> dict:
-        """解析 DeepSeek API 响应信封: {success, data, msg}"""
+    async def _parse_envelope(self, resp: httpx.Response) -> Any:
+        """解析 DeepSeek API 响应信封 {code, msg, data} / {success, data}，返回业务数据"""
         if resp.status_code != 200:
             body = await resp.aread()
             raise HTTPStatusError(resp.status_code, body.decode())
 
-        data = resp.json()
-
-        # 有时 API 直接返回数据, 有时包在 {success, data} 里
-        if isinstance(data, dict):
-            if "success" in data:
-                if not data.get("success"):
-                    raise BusinessError(
-                        data.get("code", -1),
-                        data.get("msg", "unknown error"),
-                    )
-                biz_data = data.get("data", {})
-            else:
-                biz_data = data
-        else:
-            biz_data = data
-
-        return biz_data
+        return _unwrap_envelope(resp.json())
 
     async def login(self, payload: LoginPayload) -> LoginData:
         """登录获取 token"""

@@ -51,7 +51,7 @@ class AppState:
     async def init(self):
         """初始化所有组件"""
         # 1. HTTP 客户端
-        logger.info("初始化 HTTP 客户端...")
+        logger.info("初始化 HTTP 客户端 (代理: %s)...", self.config.proxy or "直连")
         self.client = DsClient(self.config)
 
         # 2. 认证
@@ -62,7 +62,7 @@ class AppState:
 
         # 3. PoW 求解器
         logger.info("下载 WASM 并初始化 PoW 求解器...")
-        self.solver = await create_solver(self.config.wasm_url)
+        self.solver = await create_solver(self.config.wasm_url, self.config.proxy)
         logger.info("PoW 求解器初始化完成")
 
         # 4. 会话策略
@@ -248,17 +248,39 @@ def create_app(config: ProxyConfig) -> FastAPI:
 # ═══════════════════════════════════════════════════════════
 
 async def _handle_non_stream(resp, model: str) -> dict:
-    """非流式: 累积内容 + usage 后返回"""
+    """非流式: 累积内容 / tool_calls + usage 后返回"""
     full_content = ""
+    tool_calls: list[dict] = []
+    finish_reason = "stop"
     usage_data: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-    async for chunk in full_sse_pipeline(resp.aiter_bytes(), model=model, include_usage=True):
-        delta = chunk.get("choices", [{}])[0].get("delta", {})
-        if delta.get("content"):
-            full_content += delta["content"]
-        # 提取 usage
-        if "usage" in chunk and chunk["usage"]:
-            usage_data = chunk["usage"]
+    try:
+        async for chunk in full_sse_pipeline(resp.aiter_bytes(), model=model, include_usage=True):
+            choice = chunk.get("choices", [{}])[0]
+            delta = choice.get("delta", {})
+            if delta.get("content"):
+                full_content += delta["content"]
+            if delta.get("tool_calls"):
+                # 非流式响应不需要 index 字段
+                tool_calls.extend(
+                    {k: v for k, v in tc.items() if k != "index"}
+                    for tc in delta["tool_calls"]
+                )
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            # 提取 usage
+            if "usage" in chunk and chunk["usage"]:
+                usage_data = chunk["usage"]
+    finally:
+        # 每次请求新建的 session 需要及时清理
+        session_id = getattr(resp, "_session_id", None)
+        if session_id:
+            state = get_state()
+            await cleanup_session(state.client, state.token, session_id)
+
+    message: dict = {"role": "assistant", "content": full_content or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -266,8 +288,8 @@ async def _handle_non_stream(resp, model: str) -> dict:
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": full_content},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": usage_data,
     }

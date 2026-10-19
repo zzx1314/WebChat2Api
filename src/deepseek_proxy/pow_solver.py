@@ -182,17 +182,18 @@ def _write_string(store, base, alloc, text: str) -> tuple[int, int]:
 # WASM 下载 & 缓存
 # ═══════════════════════════════════════════════════════════
 
-async def fetch_wasm(wasm_url: str) -> bytes:
+async def fetch_wasm(wasm_url: str, proxy: str = "") -> bytes:
     """下载 WASM 二进制"""
-    async with httpx.AsyncClient(timeout=30.0) as http:
+    # 显式传入代理，避免 httpx 解析 ALL_PROXY 中的 socks:// 别名报错
+    async with httpx.AsyncClient(timeout=30.0, proxy=proxy or None) as http:
         resp = await http.get(wasm_url)
         resp.raise_for_status()
         return resp.content
 
 
-async def create_solver(wasm_url: str) -> PowSolver:
+async def create_solver(wasm_url: str, proxy: str = "") -> PowSolver:
     """下载 WASM 并创建求解器"""
-    wasm_bytes = await fetch_wasm(wasm_url)
+    wasm_bytes = await fetch_wasm(wasm_url, proxy)
     solver = PowSolver(wasm_bytes)
     await solver.init()
     return solver

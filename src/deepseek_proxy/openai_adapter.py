@@ -22,7 +22,7 @@ _KNOWN_MODELS: dict[str, tuple[str, bool, bool]] = {
     "deepseek-v3":       ("default", False, False),
     "deepseek-v3.2":     ("default", False, False),
     "default":           ("default", False, False),
-    "deepseek-v4-pro":   ("default", True,  True),
+    "deepseek-v4-pro":   ("default", True,  False),  # 深度推理默认不开启联网搜索
 }
 
 
@@ -122,6 +122,8 @@ class OpenAIAdapter:
             thinking_enabled=thinking_enabled,
             search_enabled=search_enabled,
             model_type=model_type,
+            # 带工具时每次新建 session，避免复用 edit_message 触发频率限制
+            fresh_session=bool(tools),
         )
 
         return resp
