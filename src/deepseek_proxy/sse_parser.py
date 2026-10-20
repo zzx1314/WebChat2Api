@@ -359,6 +359,122 @@ def make_usage_chunk(prompt_tokens: int, completion_tokens: int) -> dict:
     }
 
 
+class _ToolCallScanner:
+    """把可能跨 chunk 的 <tool_calls> / DSML 片段转换成 tool_calls delta
+
+    正文 (content) 与思考 (reasoning) 两个通道分别缓冲: 模型有时把调用写在 THINK
+    片段里，只扫描正文会让这类调用退化成思考文本，客户端拿不到工具调用就会直接
+    结束回合。任一通道识别到调用都会把 finish_reason 置为 tool_calls。
+    """
+
+    CHANNELS = ("reasoning", "content")
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.emitted = False
+        self._buffers: dict[str, str] = {ch: "" for ch in self.CHANNELS}
+        self._modes: dict[str, Optional[str]] = {ch: None for ch in self.CHANNELS}
+
+    def _chunk(self, channel: str, text: str) -> dict:
+        if channel == "reasoning":
+            return make_chunk(Delta(reasoning_content=text), model=self.model)
+        return make_chunk(Delta(content=text), model=self.model)
+
+    def feed(self, text: str, channel: str) -> list[dict]:
+        """喂入一段文本，返回可下发的 chunk（未闭合的标签先留在缓冲区）"""
+        chunks: list[dict] = []
+        buf = self._buffers[channel] + text
+
+        while True:
+            mode = self._modes[channel]
+
+            if mode is None:
+                candidates = [
+                    (buf.find(tag), tag)
+                    for tag in (_TOOL_CALLS_OPEN, _DSML_OPEN)
+                ]
+                candidates = [(idx, tag) for idx, tag in candidates if idx >= 0]
+
+                if not candidates:
+                    # 保留末尾可能是半截标签的内容，其余立即下发
+                    keep = max(
+                        _partial_tag_suffix_len(buf, tag)
+                        for tag in (_TOOL_CALLS_OPEN, _DSML_OPEN)
+                    )
+                    emit = buf[:len(buf) - keep] if keep else buf
+                    if emit:
+                        chunks.append(self._chunk(channel, emit))
+                    buf = buf[len(buf) - keep:] if keep else ""
+                    break
+
+                open_idx, open_tag = min(candidates, key=lambda item: item[0])
+                before = buf[:open_idx]
+                if before:
+                    chunks.append(self._chunk(channel, before))
+                buf = buf[open_idx + len(open_tag):]
+                self._modes[channel] = "json" if open_tag == _TOOL_CALLS_OPEN else "dsml"
+                continue
+
+            close_tag = _TOOL_CALLS_CLOSE if mode == "json" else _DSML_CLOSE
+            close_idx = buf.find(close_tag)
+            if close_idx < 0:
+                break
+
+            raw = buf[:close_idx].strip()
+            buf = buf[close_idx + len(close_tag):]
+            self._modes[channel] = None
+            chunks.extend(self._resolve(raw, mode, channel))
+
+        self._buffers[channel] = buf
+        return chunks
+
+    def _resolve(self, raw: str, mode: str, channel: str) -> list[dict]:
+        parsed = _parse_tool_calls_json(raw) if mode == "json" else _parse_dsml_tool_calls(raw)
+        if parsed:
+            self.emitted = True
+            return [make_chunk(
+                Delta(tool_calls=_build_tool_call_deltas(parsed)),
+                model=self.model,
+            )]
+
+        # 解析失败时原样输出，避免静默丢弃内容
+        open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
+        close_tag = _TOOL_CALLS_CLOSE if mode == "json" else _DSML_CLOSE
+        return [self._chunk(channel, open_tag + raw + close_tag)]
+
+    def flush(self) -> list[dict]:
+        """流结束时吐出各通道剩余缓冲"""
+        chunks: list[dict] = []
+
+        for channel in self.CHANNELS:
+            buf = self._buffers[channel]
+            self._buffers[channel] = ""
+            if not buf:
+                continue
+
+            mode = self._modes[channel]
+            self._modes[channel] = None
+            if mode is None:
+                chunks.append(self._chunk(channel, buf))
+                continue
+
+            raw = buf.strip()
+            if not raw:
+                continue
+            parsed = _parse_tool_calls_json(raw) if mode == "json" else _parse_dsml_tool_calls(raw)
+            if parsed:
+                self.emitted = True
+                chunks.append(make_chunk(
+                    Delta(tool_calls=_build_tool_call_deltas(parsed)),
+                    model=self.model,
+                ))
+            else:
+                open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
+                chunks.append(self._chunk(channel, open_tag + raw))
+
+        return chunks
+
+
 async def convert_to_openai_chunks(
     ds_frame_stream: AsyncIterator[DsFrame],
     model: str = "deepseek-chat",
@@ -371,101 +487,11 @@ async def convert_to_openai_chunks(
     usage_sent = False
     usage_value: Optional[int] = None
 
-    # Tool Call 缓冲: 标签和 JSON 都可能被拆到多个 content delta 中
-    content_buffer = ""
-    tool_mode: Optional[str] = None  # None / "json" / "dsml"
-    tool_calls_emitted = False
-
-    def _parse_by_mode(raw: str, mode: str) -> list[dict]:
-        return _parse_tool_calls_json(raw) if mode == "json" else _parse_dsml_tool_calls(raw)
-
-    def process_content(text: str) -> list[dict]:
-        """处理 content delta，累积并识别可能跨 chunk 的工具调用标签"""
-        nonlocal content_buffer, tool_mode, tool_calls_emitted
-        chunks: list[dict] = []
-        content_buffer += text
-
-        while True:
-            if tool_mode is None:
-                candidates = [
-                    (content_buffer.find(tag), tag)
-                    for tag in (_TOOL_CALLS_OPEN, _DSML_OPEN)
-                ]
-                candidates = [(idx, tag) for idx, tag in candidates if idx >= 0]
-
-                if not candidates:
-                    # 保留末尾可能是半截标签的内容，其余立即下发
-                    keep = max(
-                        _partial_tag_suffix_len(content_buffer, tag)
-                        for tag in (_TOOL_CALLS_OPEN, _DSML_OPEN)
-                    )
-                    emit = content_buffer[:len(content_buffer) - keep]
-                    if emit:
-                        chunks.append(make_chunk(Delta(content=emit), model=model))
-                    content_buffer = content_buffer[len(content_buffer) - keep:]
-                    break
-
-                open_idx, open_tag = min(candidates, key=lambda item: item[0])
-                before = content_buffer[:open_idx]
-                if before:
-                    chunks.append(make_chunk(Delta(content=before), model=model))
-                content_buffer = content_buffer[open_idx + len(open_tag):]
-                tool_mode = "json" if open_tag == _TOOL_CALLS_OPEN else "dsml"
-            else:
-                close_tag = _TOOL_CALLS_CLOSE if tool_mode == "json" else _DSML_CLOSE
-                close_idx = content_buffer.find(close_tag)
-                if close_idx < 0:
-                    break
-
-                raw = content_buffer[:close_idx].strip()
-                content_buffer = content_buffer[close_idx + len(close_tag):]
-                mode = tool_mode
-                tool_mode = None
-
-                parsed = _parse_by_mode(raw, mode)
-                if parsed:
-                    chunks.append(make_chunk(
-                        Delta(tool_calls=_build_tool_call_deltas(parsed)),
-                        model=model,
-                    ))
-                    tool_calls_emitted = True
-                else:
-                    # 解析失败时原样输出，避免静默丢弃内容
-                    open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
-                    chunks.append(make_chunk(
-                        Delta(content=open_tag + raw + close_tag),
-                        model=model,
-                    ))
-
-        return chunks
-
-    def flush_content() -> list[dict]:
-        """流结束时吐出缓冲内容"""
-        nonlocal content_buffer, tool_mode, tool_calls_emitted
-        if not content_buffer:
-            return []
-
-        if tool_mode is not None:
-            raw = content_buffer.strip()
-            mode = tool_mode
-            content_buffer = ""
-            tool_mode = None
-            parsed = _parse_by_mode(raw, mode)
-            if parsed:
-                tool_calls_emitted = True
-                return [make_chunk(
-                    Delta(tool_calls=_build_tool_call_deltas(parsed)),
-                    model=model,
-                )]
-            open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
-            return [make_chunk(Delta(content=open_tag + raw), model=model)]
-
-        text = content_buffer
-        content_buffer = ""
-        return [make_chunk(Delta(content=text), model=model)]
+    # 工具调用标签可能出现在正文或思考通道，且会被拆到多个 delta 中
+    scanner = _ToolCallScanner(model)
 
     def current_finish_reason() -> str:
-        return "tool_calls" if tool_calls_emitted else "stop"
+        return "tool_calls" if scanner.emitted else "stop"
 
     try:
         async for frame in ds_frame_stream:
@@ -474,20 +500,22 @@ async def convert_to_openai_chunks(
 
             elif frame.type == DsFrameType.THINK_DELTA:
                 text = _clean_text(frame.value)
-                if text:
-                    yield make_chunk(Delta(reasoning_content=text), model=model)
+                if not text:
+                    continue
+                for chunk in scanner.feed(text, "reasoning"):
+                    yield chunk
 
             elif frame.type == DsFrameType.CONTENT_DELTA:
                 text = _clean_text(frame.value)
                 if not text:
                     continue
-                for chunk in process_content(text):
+                for chunk in scanner.feed(text, "content"):
                     yield chunk
 
             elif frame.type == DsFrameType.STATUS:
                 status = str(frame.value) if frame.value else ""
                 if status == "FINISHED" and not finished:
-                    for chunk in flush_content():
+                    for chunk in scanner.flush():
                         yield chunk
                     finished = True
                     yield make_chunk(Delta(), model=model, finish_reason=current_finish_reason())
@@ -500,7 +528,7 @@ async def convert_to_openai_chunks(
 
             elif frame.type == DsFrameType.FINISH:
                 if not finished:
-                    for chunk in flush_content():
+                    for chunk in scanner.flush():
                         yield chunk
                     finished = True
                     yield make_chunk(Delta(), model=model, finish_reason=current_finish_reason())
@@ -510,7 +538,7 @@ async def convert_to_openai_chunks(
             yield make_usage_chunk(prompt_tokens, usage_value)
 
     # 流正常结束但没收到 FINISHED 状态: 补发缓冲内容与结束标记
-    for chunk in flush_content():
+    for chunk in scanner.flush():
         yield chunk
     if not finished:
         finished = True

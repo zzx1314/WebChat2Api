@@ -342,6 +342,62 @@ async def test_unescaped_tool_calls_json():
     print("  \u2713 未转义引号/非法转义修复后正确转为 tool_calls")
 
 
+# 模拟真实失败样本 (Pi 日志 2026-10-20): V4-Pro 把工具调用写进 THINK 片段
+THINK_TOOL_CALLS_TEXT = (
+    '我先查一下 chat.qwen.ai 是否还会重定向。\n\n'
+    '<tool_calls>[{"name": "bash", "arguments": {"command": '
+    '"curl -sS -m 30 -o /dev/null -w "%{http_code}" https://chat.qwen.ai/"}}, '
+    '{"name": "bash", "arguments": {"command": "cat qw_pre.js < qw_head.txt"}}]</tool_calls>'
+)
+
+
+def _mock_think_from_text(text: str, pieces: int = 8):
+    """把思考内容拆成多个 THINK delta，模拟跨 chunk 输出"""
+    size = max(1, len(text) // pieces + 1)
+    parts = [text[i:i + size] for i in range(0, len(text), size)]
+    events = b"event: ready\ndata: {}\n\n" + _sse_event({"v": {"response": {
+        "thinking_enabled": True,
+        "fragments": [{"type": "THINK", "content": parts[0]}],
+    }}})
+    for part in parts[1:]:
+        events += _sse_event({"p": "response/fragments/-1/content", "o": "APPEND", "v": part})
+    events += _sse_event({"p": "response/status", "o": "SET", "v": "FINISHED"})
+    events += b"event: finish\ndata: {}\n\n"
+    return events
+
+
+async def test_tool_calls_in_thinking():
+    print("\n=== 思考通道里的工具调用 (真实 Pi 日志样本) ===")
+    async def byte_stream():
+        yield _mock_think_from_text(THINK_TOOL_CALLS_TEXT)
+
+    reasoning = ""
+    content = ""
+    calls = []
+    finish = None
+    async for chunk in full_sse_pipeline(byte_stream(), model="deepseek-v4-pro"):
+        ch = chunk.get("choices", [{}])[0]
+        delta = ch.get("delta", {})
+        reasoning += delta.get("reasoning_content") or ""
+        content += delta.get("content") or ""
+        calls.extend(delta.get("tool_calls") or [])
+        finish = ch.get("finish_reason") or finish
+
+    assert "<tool_calls>" not in reasoning, f"工具调用泄漏到 reasoning: {reasoning!r}"
+    assert reasoning == "我先查一下 chat.qwen.ai 是否还会重定向。\n\n", f"思考内容错误: {reasoning!r}"
+    assert content == "", f"思考片段不应进入 content: {content!r}"
+    assert len(calls) == 2, f"Expected 2 tool calls, got {len(calls)}: {calls}"
+    assert finish == "tool_calls", f"finish_reason 应为 tool_calls，实际: {finish}"
+    assert json.loads(calls[0]["function"]["arguments"])["command"] == (
+        'curl -sS -m 30 -o /dev/null -w "%{http_code}" https://chat.qwen.ai/'
+    ), calls[0]
+    assert json.loads(calls[1]["function"]["arguments"])["command"] == "cat qw_pre.js < qw_head.txt"
+    print(f"  reasoning: {reasoning!r}")
+    print(f"  tool calls: {[c['function']['name'] for c in calls]}")
+    print(f"  finish_reason: {finish}")
+    print("  \u2713 思考通道内的 <tool_calls> 正确转成 tool_calls")
+
+
 async def test_tool_call_argument_variants():
     print("\n=== 工具调用字段变体 ===")
     from deepseek_proxy.sse_parser import _parse_tool_calls_json
@@ -373,6 +429,7 @@ async def main():
     await test_think_runtime_append()
     await test_dsml_tool_calls()
     await test_unescaped_tool_calls_json()
+    await test_tool_calls_in_thinking()
     await test_tool_call_argument_variants()
     await test_incomplete_status_not_content()
     print("\n\u2705 All tests passed!")
