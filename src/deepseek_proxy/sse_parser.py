@@ -374,6 +374,10 @@ class _ToolCallScanner:
         self.emitted = False
         self._buffers: dict[str, str] = {ch: "" for ch in self.CHANNELS}
         self._modes: dict[str, Optional[str]] = {ch: None for ch in self.CHANNELS}
+        # OpenAI 流式协议要求 index 在整个响应内唯一递增。模型可能把调用拆成
+        # 多个 <tool_calls> 块（或在 THINK/ANSWER 两个通道各写一块），若每块都从 0
+        # 开始编号，客户端按 index 聚合参数时会把多个调用拼成一段非法 JSON。
+        self._next_index = 0
 
     def _chunk(self, channel: str, text: str) -> dict:
         if channel == "reasoning":
@@ -428,14 +432,21 @@ class _ToolCallScanner:
         self._buffers[channel] = buf
         return chunks
 
+    def _tool_call_chunk(self, parsed: list[dict]) -> Optional[dict]:
+        deltas = _build_tool_call_deltas(parsed, start_index=self._next_index)
+        if not deltas:
+            return None
+        # 以最后一个 delta 的 index 为准递增: _build_tool_call_deltas 会跳过空 name
+        # 的条目，若用 len(deltas) 累加，编号会与已下发的 index 脱节
+        self._next_index = deltas[-1]["index"] + 1
+        self.emitted = True
+        return make_chunk(Delta(tool_calls=deltas), model=self.model)
+
     def _resolve(self, raw: str, mode: str, channel: str) -> list[dict]:
         parsed = _parse_tool_calls_json(raw) if mode == "json" else _parse_dsml_tool_calls(raw)
         if parsed:
-            self.emitted = True
-            return [make_chunk(
-                Delta(tool_calls=_build_tool_call_deltas(parsed)),
-                model=self.model,
-            )]
+            chunk = self._tool_call_chunk(parsed)
+            return [chunk] if chunk else []
 
         # 解析失败时原样输出，避免静默丢弃内容
         open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
@@ -463,11 +474,9 @@ class _ToolCallScanner:
                 continue
             parsed = _parse_tool_calls_json(raw) if mode == "json" else _parse_dsml_tool_calls(raw)
             if parsed:
-                self.emitted = True
-                chunks.append(make_chunk(
-                    Delta(tool_calls=_build_tool_call_deltas(parsed)),
-                    model=self.model,
-                ))
+                chunk = self._tool_call_chunk(parsed)
+                if chunk:
+                    chunks.append(chunk)
             else:
                 open_tag = _TOOL_CALLS_OPEN if mode == "json" else _DSML_OPEN
                 chunks.append(self._chunk(channel, open_tag + raw))
@@ -813,14 +822,15 @@ def _normalize_arguments(args: Any) -> dict:
     return {}
 
 
-def _build_tool_call_deltas(parsed: list[dict]) -> list[dict]:
+def _build_tool_call_deltas(parsed: list[dict], start_index: int = 0) -> list[dict]:
     tc_deltas = []
-    for i, tc in enumerate(parsed):
+    index = start_index
+    for tc in parsed:
         name = tc.get("name", "")
         if not name:
             continue
         tc_deltas.append({
-            "index": i,
+            "index": index,
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
             "function": {
@@ -828,6 +838,7 @@ def _build_tool_call_deltas(parsed: list[dict]) -> list[dict]:
                 "arguments": json.dumps(tc.get("arguments") or {}, ensure_ascii=False),
             },
         })
+        index += 1
     return tc_deltas
 
 

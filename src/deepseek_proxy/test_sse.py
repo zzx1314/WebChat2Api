@@ -398,6 +398,106 @@ async def test_tool_calls_in_thinking():
     print("  \u2713 思考通道内的 <tool_calls> 正确转成 tool_calls")
 
 
+def _aggregate_by_index(tool_calls: list[dict]) -> dict[int, dict]:
+    """模拟 Pi / OpenAI SDK 等客户端: 按 index 拼接 arguments"""
+    merged: dict[int, dict] = {}
+    for tc in tool_calls:
+        slot = merged.setdefault(tc["index"], {"name": tc["function"]["name"], "arguments": ""})
+        slot["arguments"] += tc["function"]["arguments"]
+    return merged
+
+
+# 模型可能把一次响应拆成多个 <tool_calls> 块
+MULTI_BLOCK_TOOL_CALLS_TEXT = (
+    'first <tool_calls>[{"name": "bash", "arguments": {"command": "echo A"}}, '
+    '{"name": "bash", "arguments": {"command": "echo B"}}]</tool_calls>\n'
+    'second <tool_calls>[{"name": "bash", "arguments": {"command": "echo C"}}]</tool_calls>'
+)
+
+
+async def test_multiple_tool_call_blocks():
+    print("\n=== 多个 <tool_calls> 块: index 必须全局唯一 ===")
+    async def byte_stream():
+        yield _mock_from_text(MULTI_BLOCK_TOOL_CALLS_TEXT)
+
+    calls = []
+    finish = None
+    async for chunk in full_sse_pipeline(byte_stream(), model="deepseek-v4-pro"):
+        ch = chunk.get("choices", [{}])[0]
+        calls.extend(ch.get("delta", {}).get("tool_calls") or [])
+        finish = ch.get("finish_reason") or finish
+
+    assert [c["index"] for c in calls] == [0, 1, 2], f"index 应递增: {[c['index'] for c in calls]}"
+    merged = _aggregate_by_index(calls)
+    assert len(merged) == 3, f"客户端会合并成 {len(merged)} 个调用: {merged}"
+    for slot in merged.values():
+        json.loads(slot["arguments"])  # 拼接后的参数必须是合法 JSON
+    assert [json.loads(merged[i]["arguments"])["command"] for i in range(3)] == [
+        "echo A", "echo B", "echo C",
+    ]
+    assert finish == "tool_calls"
+    print(f"  indices: {[c['index'] for c in calls]}")
+    print("  \u2713 多个调用块不会在客户端被拼成一个非法 JSON")
+
+
+MOCK_TOOL_CALLS_TWO_CHANNELS = (
+    b"event: ready\ndata: {}\n\n"
+    + _sse_event({"v": {"response": {
+        "thinking_enabled": True,
+        "fragments": [{
+            "type": "THINK",
+            "content": 'plan <tool_calls>[{"name": "bash", "arguments": {"command": "echo think"}}]</tool_calls>',
+        }],
+    }}})
+    + _sse_event({"p": "response/fragments", "o": "APPEND", "v": [{
+        "type": "RESPONSE",
+        "content": 'done <tool_calls>[{"name": "bash", "arguments": {"command": "echo answer"}}]</tool_calls>',
+    }]})
+    + _sse_event({"p": "response/status", "o": "SET", "v": "FINISHED"})
+    + b"event: finish\ndata: {}\n\n"
+)
+
+
+async def test_tool_calls_across_channels():
+    print("\n=== THINK / ANSWER 各一个调用: index 跨通道递增 ===")
+    async def byte_stream():
+        yield MOCK_TOOL_CALLS_TWO_CHANNELS
+
+    calls = []
+    async for chunk in full_sse_pipeline(byte_stream(), model="deepseek-v4-pro"):
+        calls.extend(chunk.get("choices", [{}])[0].get("delta", {}).get("tool_calls") or [])
+
+    assert [c["index"] for c in calls] == [0, 1], f"index 应跨通道递增: {[c['index'] for c in calls]}"
+    merged = _aggregate_by_index(calls)
+    assert [json.loads(merged[i]["arguments"])["command"] for i in range(2)] == [
+        "echo think", "echo answer",
+    ]
+    print(f"  indices: {[c['index'] for c in calls]}")
+    print("  \u2713 思考通道与正文通道的调用各自独立")
+
+
+async def test_non_stream_with_usage_chunk():
+    print("\n=== 非流式请求: usage chunk 不应导致 500 ===")
+    from deepseek_proxy.server import _handle_non_stream
+
+    data = MOCK_TOOL_CALLS + _sse_event({"p": "response/usage/total_token_usage", "o": "SET", "v": 42})
+
+    class FakeResp:
+        _session_id = None
+
+        async def aiter_bytes(self):
+            yield data
+
+    result = await _handle_non_stream(FakeResp(), "deepseek-v4-flash")
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "tool_calls", choice
+    assert len(choice["message"]["tool_calls"]) == 1, choice
+    assert "index" not in choice["message"]["tool_calls"][0]
+    assert result["usage"]["total_tokens"] == 42, result["usage"]
+    print(f"  usage: {result['usage']}")
+    print("  \u2713 usage chunk 被正确提取，工具调用完整返回")
+
+
 async def test_tool_call_argument_variants():
     print("\n=== 工具调用字段变体 ===")
     from deepseek_proxy.sse_parser import _parse_tool_calls_json
@@ -430,6 +530,9 @@ async def main():
     await test_dsml_tool_calls()
     await test_unescaped_tool_calls_json()
     await test_tool_calls_in_thinking()
+    await test_multiple_tool_call_blocks()
+    await test_tool_calls_across_channels()
+    await test_non_stream_with_usage_chunk()
     await test_tool_call_argument_variants()
     await test_incomplete_status_not_content()
     print("\n\u2705 All tests passed!")

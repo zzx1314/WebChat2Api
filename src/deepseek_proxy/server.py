@@ -256,7 +256,14 @@ async def _handle_non_stream(resp, model: str) -> dict:
 
     try:
         async for chunk in full_sse_pipeline(resp.aiter_bytes(), model=model, include_usage=True):
-            choice = chunk.get("choices", [{}])[0]
+            # usage chunk 的 choices 为空，直接取 [0] 会抛 IndexError，导致整个非流式请求 500
+            if chunk.get("usage"):
+                usage_data = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+
+            choice = choices[0]
             delta = choice.get("delta", {})
             if delta.get("content"):
                 full_content += delta["content"]
@@ -268,9 +275,6 @@ async def _handle_non_stream(resp, model: str) -> dict:
                 )
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
-            # 提取 usage
-            if "usage" in chunk and chunk["usage"]:
-                usage_data = chunk["usage"]
     finally:
         # 每次请求新建的 session 需要及时清理
         session_id = getattr(resp, "_session_id", None)
